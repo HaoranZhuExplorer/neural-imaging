@@ -22,6 +22,7 @@ from models.layers import Quantization
 from models.tfmodel import TFModel
 from compression import jpeg_helpers
 from helpers.utils import is_number
+from helpers import tf_helpers
 from compression.jpeg_helpers import jpeg_qtable, jpeg_qf_estimation
 
 _common_codec = None
@@ -87,7 +88,7 @@ class DifferentiableJPEG(tf.keras.Model):
         
         # Quantization layer
         self.quantization = Quantization(self.rounding_approximation, self.rounding_approximation_steps, latent_bpf=9)
-
+    
     def call(self, inputs):
         block_size = 8
 
@@ -128,6 +129,7 @@ class DifferentiableJPEG(tf.keras.Model):
                 Q = tf.tile(Q, [(tf.shape(inputs)[0]), 1, 1])
                 X = X / Q
                 X = self.quantization(X)
+                X_hat = X
                 X = X * Q
 
             with tf.name_scope('idct'):
@@ -156,7 +158,7 @@ class DifferentiableJPEG(tf.keras.Model):
                 y = y / 255.0                    
                 y = tf.clip_by_value(y, 0, 1)
 
-        return y, X
+        return y, X_hat
 
 
 class JPEG(TFModel):
@@ -208,21 +210,22 @@ class JPEG(TFModel):
         """
 
         quality = self.quality if quality is None else quality
+        quality = int(quality)
 
         if not is_valid_quality(quality):
             raise ValueError('Invalid or unspecified JPEG quality!')
 
-        if hasattr(quality, '__getitem__') and len(quality) > 2:
-            quality = int(np.random.choice(quality))
+#         if hasattr(quality, '__getitem__') and len(quality) > 2:
+#             quality = int(np.random.choice(quality))
         
-        elif hasattr(quality, '__getitem__') and len(quality) == 2:
-            quality = np.random.randint(quality[0], quality[1])
+#         elif hasattr(quality, '__getitem__') and len(quality) == 2:
+#             quality = np.random.randint(quality[0], quality[1])
         
-        elif is_number(quality) and quality >= 1 and quality <= 100:
-            quality = int(quality)
+#         elif is_number(quality) and quality >= 1 and quality <= 100:
+#             quality = int(quality)
         
-        else:
-            raise ValueError('Invalid quality! {}'.format(quality))
+        #else:
+        #    raise ValueError('Invalid quality! {}'.format(quality))
 
         if self._model is None:
             if not isinstance(batch_x, np.ndarray):
@@ -244,11 +247,67 @@ class JPEG(TFModel):
 
             if return_entropy:
                 # TODO This currently takes too much memory
-                # entropy = tf_helpers.entropy(X, self._model.quantization.codebook)[0]
-                entropy = np.nan
-                return y, entropy
+                entropy = tf_helpers.entropy(X, self._model.quantization.codebook, v=5, gamma=5)[0]
+                return y, X, entropy
 
             return y
+    
+    
+    # function that train an optimal quantization table for a particular image
+    # alpha, beta are the hyperparameter that controls the weight between distortion loss and entropy
+    # n_times is number of times that we do the optimization step   
+    def train_q_table(self, batch_x, alpha, beta, n_times):
+        
+        # set the training point at self.quality of standard jpeg quantization table 
+        q_mtx_luma_init = jpeg_qtable(self.quality, 0)
+        q_mtx_chroma_init = jpeg_qtable(self.quality, 1)
+        self._model._q_mtx_luma = self._model.add_weight('Q_mtx_luma', [8, 8], dtype=tf.float32, initializer=tf.constant_initializer(q_mtx_luma_init))
+        self._model._q_mtx_chroma = self._model.add_weight('Q_mtx_chroma', [8, 8], dtype=tf.float32, initializer=tf.constant_initializer(q_mtx_chroma_init))
+        print("quantization before training: ", self._model._q_mtx_luma, self._model._q_mtx_chroma)
+        
+        opt = tf.keras.optimizers.SGD(5)
+        
+        target_entropy = 0
+        
+        for epoch in range(0, n_times+1):
+            with tf.GradientTape() as tape1:
+                batch_y, Z, entropy_code = self.process(batch_x, return_entropy=True)
+                ssim = tf.reduce_mean(tf.image.ssim(tf.convert_to_tensor(255.0*batch_y), tf.convert_to_tensor(255.0*batch_x), max_val=255))
+                ssim_loss = 1-ssim
+                distortion = tf.reduce_mean(tf.math.pow((255.0*batch_x-255.0*batch_y),2))
+                if epoch==0:
+                    target_entropy = entropy_code
+                
+                
+                if entropy_code<target_entropy:
+                    loss = alpha*distortion + beta*(entropy_code-target_entropy)
+                else:
+                    loss = alpha*distortion + beta*(100*(entropy_code-target_entropy))**2
+                
+            grad = tape1.gradient(loss, self.parameters)
+            grad = [x/(1e-12 + tf.linalg.norm(x)) for x in grad]
+
+           
+            
+            opt.apply_gradients(zip(grad, self.parameters))
+            
+            if epoch==n_times:
+                self._model._q_mtx_luma = tf.clip_by_value(tf.round(self._model._q_mtx_luma), clip_value_min=1, clip_value_max=256)
+                self._model._q_mtx_chroma = tf.clip_by_value(tf.round(self._model._q_mtx_chroma),clip_value_min=1, clip_value_max=256)
+        
+            qf=self.estimate_qf(0)
+            qt=self._model._q_mtx_luma
+            
+            print(f'{epoch:03d} --> {ssim:.2f} {loss:.2f} {distortion:.2f} {entropy_code:.2f} {qf} {qt[0, 0]} {qt[0, 1]}')
+            
+        
+        
+        
+        print("quantization after training: ", self._model._q_mtx_luma, self._model._q_mtx_chroma)
+        return  self._model._q_mtx_luma, self._model._q_mtx_chroma
+
+    
+    
 
     def __repr__(self):
         if self._model is not None:

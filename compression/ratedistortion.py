@@ -16,8 +16,182 @@ import helpers.stats
 import helpers.utils
 from helpers import loading, utils, fsutil
 from compression import jpeg_helpers, codec, bpg_helpers
-
 from loguru import logger
+
+from models import jpeg
+from helpers import dataset
+
+
+def get_diff_jpeg_df(directory, write_files=False, effective_bytes=True, force_calc=False):
+    """
+    Compute and return (as Pandas DF) the rate distortion curve for diff JPEG. The result is saved
+    as a CSV file in the source directory. If the file exists, the DF is loaded and returned.
+    Files are saved as JPEG using imagemagick
+    """
+
+    files, _ = loading.discover_images(directory, n_images=-1, v_images=0)
+    batch_x = loading.load_images(files, directory, load='y')
+    batch_x = batch_x['y'].astype(np.float32) / (2 ** 8 - 1)
+    
+    # Get trade-off for JPEG
+    alpha_range = np.arange(1000, 100, -100)
+    quality_levels = np.arange(95, 5, -5)
+    df_jpeg_path = os.path.join(directory, 'diff_jpeg.csv')
+
+    if os.path.isfile(df_jpeg_path) and not force_calc:
+        print('Restoring diff JPEG stats from {}'.format(df_jpeg_path))
+        df = pd.read_csv(df_jpeg_path, index_col=False)
+    else:
+        df = pd.DataFrame(columns=['image_id', 'filename', 'codec', 'quality', 'ssim', 'psnr', 'msssim', 'msssim_db', 'bytes', 'bpp'])
+
+        
+        data = dataset.Dataset(directory, n_images=1, v_images=0, val_n_patches=1, load='y')
+        batch_rgb = data.next_training_batch(0, 1, 64)
+        codec_differentiable = jpeg.JPEG(50, codec='soft', trainable=True)
+
+        
+        with tqdm.tqdm(total=len(files) * len(quality_levels), ncols=120, desc='JPEG') as pbar:
+
+            for image_id, filename in enumerate(files):
+
+                for q_i, q in enumerate(quality_levels):
+
+                    codec_differentiable.quality = q
+                    
+                    # Read the original image
+                    image = batch_x[image_id]
+                    
+                    
+                    luma, chroma = codec_differentiable.train_q_table(batch_rgb, alpha=1, beta=100, n_times=20)
+                    
+                    
+                    
+                    with open('data/diff_jpeg/image1/quantization-table.xml', 'r') as input_file, open('data/diff_jpeg/image1/quantization-table-diff.xml', 'w') as output_file:
+                        for line in input_file:
+                            xml_data = input_file.readlines()        
+        
+                        index_1 = 43
+                        for i in range(0, len(luma.numpy())):
+                            q_table_this_line_luma = luma.numpy()[i]
+                            xml_data[index_1+i]="     "+str(int(q_table_this_line_luma[0]))+", "+str(int(q_table_this_line_luma[1]))+", "+str(int(q_table_this_line_luma[2]))+", "+str(int(q_table_this_line_luma[3]))+", "+str(int(q_table_this_line_luma[4]))+", "+str(int(q_table_this_line_luma[5]))+", "+str(int(q_table_this_line_luma[6]))+", "+str(int(q_table_this_line_luma[7]))+", "+"\n"
+
+                        index_2 = 68
+                        for i in range(0, len(chroma.numpy())):
+                            q_table_this_line_chroma = chroma.numpy()[i]
+                            xml_data[index_2+i]="     "+str(int(q_table_this_line_chroma[0]))+", "+str(int(q_table_this_line_chroma[1]))+", "+str(int(q_table_this_line_chroma[2]))+", "+str(int(q_table_this_line_chroma[3]))+", "+str(int(q_table_this_line_chroma[4]))+", "+str(int(q_table_this_line_chroma[5]))+", "+str(int(q_table_this_line_chroma[6]))+", "+str(int(q_table_this_line_chroma[7]))+", "+"\n"
+
+                        output_file.writelines(xml_data)
+                    
+                    
+                    
+                    # Compress images and get effective bytes (only image data - no headers)
+                    os.system('magick convert -quality '+str(50)+' -define jpeg:q-table=data/diff_jpeg/image1/quantization-table-diff.xml'+' '+directory+'/'+filename+' '+ directory+'/'+filename+'_'+str(50)+'_compressed.jpeg')
+                    
+                    if effective_bytes:
+                        with open(directory+'/'+filename+"_"+str(50)+'_compressed.jpeg', 'rb') as fh:
+                            buf = io.BytesIO(fh.read())
+                        image_bytes = JPEGMarkerStats(buf.getvalue()).get_effective_bytes()
+                    else:
+                        image_bytes = os.path.getsize(directory+'/'+filename+"_"+str(50)+'_compressed.jpeg')
+                    image = imageio.imread(directory+'/'+filename).astype(np.float) / (2**8 - 1)
+                    image_compressed = imageio.imread(directory+'/'+filename+"_"+str(50)+'_compressed.jpeg').astype(np.float) / (2**8 - 1)
+                    image_compressed_path = directory + '/' + filename + "_" + str(50) + '_compressed.jpeg'
+                    image_path = directory + '/' + filename
+                    
+                    if not write_files:
+                        os.remove(directory+'/'+filename+"_"+str(50)+'_compressed.jpeg')
+
+                        
+                    msssim_value = msssim(image, image_compressed, MAX=1).real
+                    
+                    
+
+                    df = df.append({'image_id': image_id,
+                                    'filename': filename,
+                                    'codec': 'jpeg',
+                                    'quality': q,
+                                    'ssim': compare_ssim(image, image_compressed, multichannel=True, data_range=1),
+                                    'psnr': compare_psnr(image, image_compressed, data_range=1),
+                                    'msssim': msssim_value,
+                                    'msssim_db': -10 * np.log10(1 - msssim_value),
+                                    #'perceptual similarity': perceptual_similarity,
+                                    'bytes': image_bytes,
+                                    'bpp': 8 * image_bytes / image.shape[0] / image.shape[1]
+                                    }, ignore_index=True)
+
+                    pbar.set_postfix(image_id=image_id, quality=q)
+                    pbar.update(1)
+        df.to_csv(os.path.join(directory, 'diff_jpeg.csv'), index=False)
+    return df
+
+def get_jpeg_imagemagick_df(directory, write_files=False, effective_bytes=True, force_calc=False):
+    """
+    Compute and return (as Pandas DF) the rate distortion curve for JPEG. The result is saved
+    as a CSV file in the source directory. If the file exists, the DF is loaded and returned.
+
+    Files are saved as JPEG using imageio.
+    """
+
+    files, _ = loading.discover_images(directory, n_images=-1, v_images=0)
+    batch_x = loading.load_images(files, directory, load='y')
+    batch_x = batch_x['y'].astype(np.float32) / (2 ** 8 - 1)
+
+    # Get trade-off for JPEG
+    quality_levels = np.arange(95, 5, -5)
+    df_jpeg_path = os.path.join(directory, 'jpeg.csv')
+
+    if os.path.isfile(df_jpeg_path) and not force_calc:
+        logger.info('Restoring JPEG stats from {}'.format(df_jpeg_path))
+        df = pd.read_csv(df_jpeg_path, index_col=False)
+    else:
+        df = pd.DataFrame(columns=['image_id', 'filename', 'codec', 'quality', 'ssim', 'psnr', 'msssim', 'msssim_db', 'bytes', 'bpp'])
+
+        with tqdm.tqdm(total=len(files) * len(quality_levels), ncols=120, desc='JPEG') as pbar:
+
+            for image_id, filename in enumerate(files):
+
+                # Read the original image
+                image = batch_x[image_id]
+
+                for qi, q in enumerate(quality_levels):
+                    
+                    os.system('magick convert -quality '+str(q)+' -define jpeg:q-table=data/diff_jpeg/image1/quantization-table.xml'+' '+directory+'/'+filename+' '+ directory+'/'+filename+'_'+str(q)+'_compressed.jpeg')
+
+                    if effective_bytes:
+                        with open(directory+'/'+filename+"_"+str(q)+'_compressed.jpeg', 'rb') as fh:
+                            buf = io.BytesIO(fh.read())
+                        image_bytes = JPEGMarkerStats(buf.getvalue()).get_effective_bytes()
+                    else:
+                        image_bytes = os.path.getsize(directory+'/'+filename+"_"+str(q)+'_compressed.jpeg')
+                    image = imageio.imread(directory+'/'+filename).astype(np.float) / (2**8 - 1)
+                    image_compressed = imageio.imread(directory+'/'+filename+"_"+str(q)+'_compressed.jpeg').astype(np.float) / (2**8 - 1)
+                    image_compressed_path = directory + '/' + filename + "_" + str(50) + '_compressed.jpeg'
+                    image_path = directory + '/' + filename
+                    
+                    if not write_files:
+                        os.remove(directory+'/'+filename+"_"+str(q)+'_compressed.jpeg')
+
+                    msssim_value = msssim(image, image_compressed, MAX=1).real
+
+                    df = df.append({'image_id': image_id,
+                                    'filename': filename,
+                                    'codec': 'jpeg',
+                                    'quality': q,
+                                    'ssim': compare_ssim(image, image_compressed, multichannel=True, data_range=1),
+                                    'psnr': compare_psnr(image, image_compressed, data_range=1),
+                                    'msssim': msssim_value,
+                                    'msssim_db': -10 * np.log10(1 - msssim_value),
+                                    'bytes': image_bytes,
+                                    'bpp': 8 * image_bytes / image.shape[0] / image.shape[1]
+                                    }, ignore_index=True)
+
+                    pbar.set_postfix(image_id=image_id, quality=q)
+                    pbar.update(1)
+
+        df.to_csv(os.path.join(directory, 'jpeg.csv'), index=False)
+
+    return df
+
 
 
 def get_jpeg_df(directory, write_files=False, effective_bytes=True, force_calc=False):
@@ -509,7 +683,7 @@ def plot_curve(plots, axes,
             x = dfg.mean()['bpp'].values
             y = dfg.mean()[metric].values
 
-            axes.plot(x, y, styles[index][0], label=labels[index] if add_legend else None, marker=avg_markers[index], alpha=0.65)
+            axes.plot(x, y, styles[index][0], label=labels[index] if add_legend else None, marker=avg_markers[index], quality=q)
             y_min = min([y_min, min(y)]) if update_ylim else y_min
 
         elif plot == 'none':
